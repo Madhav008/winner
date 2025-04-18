@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Encrypted Video</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/shaka-player/3.1.1/shaka-player.compiled.js"></script>
+</head>
+<body>
+  <video id="video" width="640" height="360" controls></video>
+
+  <script>
+    const video = document.getElementById('video');
+    const player = new shaka.Player(video);
+
+    player.configure({
+      drm: {
+        clearKeys: {
+          '1ae8ccd0-e4f7-6c23-f026-8756e64f9a3a': '1ae8ccd0e4f76c23f0268756e64f9a3a',
+        },
+        widevine: {
+          licenseServerUri: 'http://localhost:8000/widevine-license',
+        },
+      },
+    });
+
+    player.load('http://localhost:8000/encrypted.mpd').then(() => {
+      console.log('Video loaded successfully');
+    }).catch(error => {
+      console.error('Error loading video', error);
+    });
+  </script>
+</body>
+</html>
