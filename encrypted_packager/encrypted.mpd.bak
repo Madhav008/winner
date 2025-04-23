@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--Generated with
+https://github.com/shaka-project/shaka-packager version v3.4.2-c819dea-debug-->
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="urn:mpeg:dash:schema:mpd:2011 DASH-MPD.xsd"
+  xmlns:cenc="urn:mpeg:cenc:2013"
+  profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" minBufferTime="PT2S" type="static"
+  mediaPresentationDuration="PT364.160004S"> <!-- Total duration: VOD (339.160004s) + Ad (25s) -->
+
+  <!-- Period for VOD Content (First Play) -->
+  <Period id="0">
+    <AdaptationSet id="0" contentType="video" width="1920" height="1080" frameRate="12800/512"
+      subsegmentAlignment="true" par="16:9">
+      <SupplementalProperty schemeIdUri="urn:mpeg:mpegB:cicp:TransferCharacteristics" value="1" />
+      <ContentProtection value="cenc" schemeIdUri="urn:mpeg:dash:mp4protection:2011"
+        cenc:default_KID="1ae8ccd0-e4f7-6c23-f026-8756e64f9a3a" />
+      <ContentProtection schemeIdUri="urn:uuid:1077efec-c0b2-4d02-ace3-3c1e52e2fb4b">
+        <cenc:pssh>AAAANHBzc2gBAAAAEHfv7MCyTQKs4zweUuL7SwAAAAEa6MzQ5PdsI/Amh1bmT5o6AAAAAA==</cenc:pssh>
+      </ContentProtection>
+      <Representation id="0" bandwidth="2516864" codecs="avc1.4d4028" mimeType="video/mp4" sar="1:1">
+        <BaseURL>init.mp4</BaseURL> <!-- VOD Base URL -->
+        <SegmentBase indexRange="1199-1638" timescale="12800">
+          <Initialization range="0-1198" />
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+
+  <!-- Period for Ad Content (Second Play) -->
+  <Period id="1" start="PT339.160004S">
+    <AdaptationSet id="1" contentType="video" width="720" height="1280" frameRate="12800/512"
+      subsegmentAlignment="true" par="9:16">
+      <SupplementalProperty schemeIdUri="urn:mpeg:mpegB:cicp:TransferCharacteristics" value="1" />
+      <ContentProtection value="cenc" schemeIdUri="urn:mpeg:dash:mp4protection:2011"
+        cenc:default_KID="1ae8ccd0-e4f7-6c23-f026-8756e64f9a3a" />
+      <ContentProtection schemeIdUri="urn:uuid:1077efec-c0b2-4d02-ace3-3c1e52e2fb4b">
+        <cenc:pssh>AAAANHBzc2gBAAAAEHfv7MCyTQKs4zweUuL7SwAAAAEa6MzQ5PdsI/Amh1bmT5o6AAAAAA==</cenc:pssh>
+      </ContentProtection>
+      <Representation id="1" bandwidth="1058298" codecs="avc1.64001f" mimeType="video/mp4" sar="1:1">
+        <BaseURL>ad/ad_init.mp4</BaseURL> <!-- Ad Base URL -->
+        <SegmentBase indexRange="1193-1272" timescale="12800">
+          <Initialization range="0-1192" />
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+
+</MPD>

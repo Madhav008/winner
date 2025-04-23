@@ -1,177 +1,272 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
-	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 )
 
-// Struct to hold clearkey responses (optional)
-type Key struct {
-	KID string `json:"kid"`
-	Key string `json:"key"`
+var client = &http.Client{} // Shared HTTP client
+type Channel struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Logo       string `json:"logo"`
+	Group      string `json:"group"`
+	LicenseURL string `json:"license_url"`
+	StreamURL  string `json:"stream_url"`
 }
 
-type LicenseResponse struct {
-	Keys []Key `json:"keys"`
-}
+func loadChannels() ([]Channel, error) {
+	// Open the channels.json file
+	file, err := os.Open("channels.json")
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
 
-// OTT Navigator static headers
-var ottHeaders = map[string]string{
-	"Accept-Encoding": "gzip",
-	"Connection":      "Keep-Alive",
-	"Host":            "la.drmlive.net",
-	"User-Agent":      "OTT Navigator/1.7.2.2 (Linux;Android 13; en; 7177yu)",
-}
-
-// Middleware to forward the headers from the OTT Navigator app and inject static headers
-func makeRequestWithNavigatorHeaders(method, targetURL string, originalReq *http.Request) (*http.Response, error) {
-	client := &http.Client{}
-	req, err := http.NewRequest(method, targetURL, nil)
+	// Read the contents of the file
+	data, err := ioutil.ReadAll(file)
 	if err != nil {
 		return nil, err
 	}
 
-	// Inject static OTT headers ONLY
-	for k, v := range ottHeaders {
-		req.Header.Set(k, v)
-	}
-
-	// Log the request details (headers injected)
-	log.Printf("Sending request to %s with headers: %v\n", targetURL, req.Header)
-
-	// Perform the request
-	resp, err := client.Do(req)
+	// Unmarshal JSON data into a slice of Channel structs
+	var channels []Channel
+	err = json.Unmarshal(data, &channels)
 	if err != nil {
 		return nil, err
 	}
-
-	// Log the response headers
-	log.Printf("Received response from %s with headers: %v\n", targetURL, resp.Header)
-
-	return resp, nil
+	// log.Println("[INFO] Channels loaded")
+	return channels, nil
 }
 
-// Handler to fetch and rewrite playlist to use your proxy URLs
-func handlePlaylistProxy(w http.ResponseWriter, r *http.Request) {
-	playlistURL := r.URL.Query().Get("url")
-	if playlistURL == "" {
-		http.Error(w, "Missing url param", http.StatusBadRequest)
-		return
-	}
-
-	// Fetch the original playlist
-	resp, err := makeRequestWithNavigatorHeaders("GET", playlistURL, r)
+func extractHost(mpUrl string) (string, error) {
+	parsedUrl, err := url.Parse(mpUrl)
 	if err != nil {
-		http.Error(w, "Failed to fetch playlist: "+err.Error(), http.StatusInternalServerError)
-		return
+		return "", err
 	}
-	defer resp.Body.Close()
-
-	scanner := bufio.NewScanner(resp.Body)
-	var output strings.Builder
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Replace license_key=... with your proxy
-		if strings.Contains(line, "license_key=") {
-			// Extract id from original URL
-			if idx := strings.Index(line, "id="); idx != -1 {
-				id := strings.Split(line[idx:], "&")[0][3:] // crude id=xyz extraction
-				line = `#KODIPROP:inputstream.adaptive.license_key=http://` + r.Host + `/proxy/license?id=` + id
-			}
-		}
-
-		// Replace MPD URLs with your proxy
-		if strings.HasSuffix(line, ".mpd") {
-			parts := strings.Split(line, "/")
-			mpdName := parts[len(parts)-1]
-			line = `http://` + r.Host + `/proxy/mpd?url=` + mpdName
-
-			
-		}
-		output.WriteString(line + "\n")
-	}
-
-	if err := scanner.Err(); err != nil {
-		http.Error(w, "Failed to scan playlist", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/x-mpegURL")
-	w.Write([]byte(output.String()))
+	return parsedUrl.Host, nil
 }
 
-// Proxy request and forward headers from client (e.g., OTT Navigator)
-func handleLicense(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		http.Error(w, "Missing id param", http.StatusBadRequest)
-		return
-	}
-
-	licenseURL := "https://mix.drmlive.net/mix/sports_key.php?id=" + url.QueryEscape(id)
-
-	resp, err := makeRequestWithNavigatorHeaders("GET", licenseURL, r)
+func getLicenseId(id string) (Channel, string) {
+	channels, err := loadChannels()
 	if err != nil {
-		http.Error(w, "Failed to fetch license: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		http.Error(w, "Failed to read license body", http.StatusInternalServerError)
-		return
+		log.Fatalf("Error loading channels: %v", err)
+		return Channel{}, ""
 	}
 
-	// Optional: parse and log clearkeys
-	var license LicenseResponse
-	if err := json.Unmarshal(body, &license); err == nil {
-		for _, key := range license.Keys {
-			fmt.Printf("Captured KID: %s | KEY: %s\n", key.KID, key.Key)
-			// Optional: Save to DB here
+	// Loop through channels to find the channel where license_url contains the id
+	for _, channel := range channels {
+		if strings.Contains(channel.LicenseURL, id) {
+			// log.Printf("[INFO] Found channel: %+v", channel)
+			host, _ := extractHost(channel.StreamURL)
+			return channel, host
 		}
 	}
-
-	// Forward license response to client
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(body)
-}
-
-// Proxy for DASH MPD URL
-func handleMPD(w http.ResponseWriter, r *http.Request) {
-	// Example: /proxy/mpd?url=sportsss1.mpd
-	path := r.URL.Query().Get("url")
-	if path == "" {
-		http.Error(w, "Missing url param", http.StatusBadRequest)
-		return
-	}
-
-	mpdURL := "https://mix.drmlive.net/mix/" + path
-
-	resp, err := makeRequestWithNavigatorHeaders("GET", mpdURL, r)
-	if err != nil {
-		http.Error(w, "Failed to fetch MPD: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	w.Header().Set("Content-Type", "application/dash+xml")
-	io.Copy(w, resp.Body)
+	return Channel{}, "" // Return empty if not found
 }
 
 func main() {
-	http.HandleFunc("/proxy/license", handleLicense)
-	http.HandleFunc("/proxy/mpd", handleMPD)
-	http.HandleFunc("/proxy/playlist", handlePlaylistProxy)
+	http.HandleFunc("/mpd-proxy.mpd", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("[INFO] Incoming request to /mpd-proxy")
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			log.Println("[ERROR] Missing id param")
+			http.Error(w, "Missing id param", http.StatusBadRequest)
+			return
+		}
 
-	fmt.Println("🎯 DRM Proxy Server running at :8080")
+		channel, host := getLicenseId(id)
+
+		if channel.StreamURL == "" {
+			log.Println("[ERROR] No mpd url found for id", id)
+			http.Error(w, "No license url found", http.StatusNotFound)
+			return
+		}
+		req, err := http.NewRequest("GET", channel.StreamURL, nil)
+		if err != nil {
+			log.Println("[ERROR] Failed to build request:", err)
+			http.Error(w, "Request build error", http.StatusInternalServerError)
+			return
+		}
+
+		// Spoof headers
+		req.Header.Set("User-Agent", "OTT Navigator/1.7.2.2 (Linux;Android 13; 7177yu) ExoPlayerLib/2.15.1")
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("Connection", "Keep-Alive")
+		req.Host = host
+
+		log.Println("[INFO] Request Headers:")
+		for k, v := range req.Header {
+			log.Println(k, ":", v)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Println("[ERROR] MPD fetch failed:", err)
+			http.Error(w, "MPD fetch failed", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		log.Println("[INFO] MPD fetch successful. Status Code:", resp.StatusCode)
+
+		// Read the full body
+		buf := new(bytes.Buffer)
+		_, err = io.Copy(buf, resp.Body)
+		if err != nil {
+			log.Println("[ERROR] Failed reading MPD body:", err)
+			http.Error(w, "Failed to read MPD", http.StatusInternalServerError)
+			return
+		}
+
+		originalContent := buf.String()
+
+		// Optional: Fix mixed content issues (HTTP -> HTTPS)
+		modified := strings.ReplaceAll(originalContent, "http://", "https://")
+
+		// Return to client
+		w.Header().Set("Content-Type", "application/dash+xml")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write([]byte(modified))
+	})
+
+	// http.HandleFunc("/license-proxy", func(w http.ResponseWriter, r *http.Request) {
+	// 	log.Println("[INFO] Incoming request to /license-proxy")
+
+	// 	log.Println("[INFO] License request Headers:")
+	// 	for k, v := range r.Header {
+	// 		log.Println(k, ":", v)
+	// 	}
+	// 	// Read the body coming from the player
+	// 	body, err := io.ReadAll(r.Body)
+	// 	log.Println("[INFO] Request body:", string(body))
+	// 	if err != nil {
+	// 		log.Println("[ERROR] Failed to read request body:", err)
+	// 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+	// 		return
+	// 	}
+
+	// 	req, err := http.NewRequest("POST", "https://la.drmlive.net/tp/sling_ck?id=672", bytes.NewReader(body))
+	// 	if err != nil {
+	// 		log.Println("[ERROR] Failed to build license request:", err)
+	// 		http.Error(w, "Request build error", http.StatusInternalServerError)
+	// 		return
+	// 	}
+
+	// 	// Spoof headers
+	// 	req.Header.Set("User-Agent", "OTT Navigator/1.7.2.2 (Linux;Android 13; 7177yu) ExoPlayerLib/2.15.1")
+	// 	req.Header.Set("Content-Type", "application/json")
+	// 	req.Header.Set("Accept-Encoding", "gzip")
+	// 	req.Header.Set("Connection", "Keep-Alive")
+	// 	req.Header.Set("Host", "la.drmlive.net")
+
+	// 	resp, err := client.Do(req)
+	// 	if err != nil {
+	// 		log.Println("[ERROR] License request failed:", err)
+	// 		http.Error(w, "License request failed", http.StatusBadGateway)
+	// 		return
+	// 	}
+	// 	defer resp.Body.Close()
+
+	// 	log.Println("[INFO] License response received. Status Code:", resp.StatusCode)
+	// 	log.Println("[INFO] Response Body:", resp.Body)
+	// 	// Return the license response to the client
+	// 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	// 	w.WriteHeader(resp.StatusCode)
+	// 	_, _ = io.Copy(w, resp.Body)
+	// })
+
+	http.HandleFunc("/proxy/license", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("[INFO] Incoming request to /license-proxy")
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			log.Println("[ERROR] Missing id param")
+			http.Error(w, "Missing id param", http.StatusBadRequest)
+			return
+		}
+		// Read the body from the original player request
+		playerBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Println("[ERROR] Failed to read player request body:", err)
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		channel, host := getLicenseId(id)
+		log.Println("[INFO] Channel:", channel.Name, "License URL:", channel.LicenseURL, "Body:", r.Body)
+		// Send that same body to the license server
+		req, err := http.NewRequest("POST", channel.LicenseURL, bytes.NewReader(playerBody))
+		if err != nil {
+			log.Println("[ERROR] Failed to build license request:", err)
+			http.Error(w, "Request build error", http.StatusInternalServerError)
+			return
+		}
+
+		// Copy headers exactly
+		req.Header.Set("User-Agent", r.Header.Get("User-Agent"))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("Connection", "Keep-Alive")
+		req.Header.Set("Host", host)
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Println("[ERROR] License request failed:", err)
+			http.Error(w, "License request failed", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		// Decompress if response is gzipped
+		var responseBody []byte
+		if resp.Header.Get("Content-Encoding") == "gzip" {
+			gr, err := gzip.NewReader(resp.Body)
+			if err != nil {
+				log.Println("[ERROR] Failed to decompress gzip response:", err)
+				http.Error(w, "Decompression error", http.StatusInternalServerError)
+				return
+			}
+			defer gr.Close()
+			responseBody, err = io.ReadAll(gr)
+			log.Println("[INFO] Channel:", channel.Name, "License URL:", channel.LicenseURL, "Response Key:", responseBody)
+		} else {
+			responseBody, err = io.ReadAll(resp.Body)
+		}
+		if err != nil {
+			log.Println("[ERROR] Failed to read license response:", err)
+			http.Error(w, "Read response error", http.StatusInternalServerError)
+			return
+		}
+
+		// Set proper headers for JSON response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(responseBody)
+	})
+
+	http.HandleFunc("/playlist.m3u", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("[INFO] Incoming request to /proxy_playlist.m3u")
+		playlistData, err := os.ReadFile("proxy_playlist.m3u")
+		if err != nil {
+			log.Println("[ERROR] Failed to read proxy playlist:", err)
+			http.Error(w, "Proxy playlist read error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/x-mpegURL")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(playlistData)
+	})
+
+	log.Println("✅ Proxy server running on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
