@@ -12,7 +12,7 @@ services:
       - ./tataplay:/var/www/html
       - ./apache/apache.conf:/etc/apache2/sites-available/000-default.conf # Custom Apache config
     ports:
-      - "8080:80"
+      - "8181:80"
     depends_on:
       - php
     networks:
