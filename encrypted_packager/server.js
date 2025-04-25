@@ -153,6 +153,10 @@ app.use("/get_license", express.raw({ type: "*/*" }));
 
 app.post("/get_license", async (req, res) => {
   try {
+    const id = req.query.id;
+    if (!id) {
+      return res.status(400).json({ error: "ID parameter is required" });
+    }
     const decodedBody = Buffer.from(req.body).toString();
     const jsonBody = JSON.parse(decodedBody);
     console.log(jsonBody);
@@ -191,7 +195,7 @@ app.post("/get_license", async (req, res) => {
 
     // Forward to license server if not custom KID
     const response = await axios.post(
-      "https://tp.drmlive-01.workers.dev?id=78",
+      `https://tp.drmlive-01.workers.dev?id=${id}`,
       jsonBody,
       {
         headers: {
@@ -216,7 +220,8 @@ app.post("/get_license", async (req, res) => {
 // Rewrite MPD so all URLs go through proxy
 app.get("/encrypted.mpd", async (req, res) => {
   try {
-    const realMPDUrl = "http://192.168.1.68/tataplay/manifest.mpd?id=78";
+    const id = req.query.id || "78"; // Default ID if not provided
+    const realMPDUrl = `http://192.168.1.68/tataplay/manifest.mpd?id=${id}`;
 
     let mpdText;
 
@@ -226,11 +231,11 @@ app.get("/encrypted.mpd", async (req, res) => {
       });
 
       mpdText = response.data;
-      // console.log(mpdText);
     } else {
       mpdText = fs.readFileSync("./ad_encrypted.mpd", "utf-8");
       adpresent = false;
     }
+
     res.setHeader("Content-Type", "application/dash+xml");
     res.set(spoofHeaders);
     // const updatedMPD = insertAdIntoMPD(mpdText);
@@ -243,36 +248,30 @@ app.get("/encrypted.mpd", async (req, res) => {
 });
 
 // Generate M3U Playlist with License URL and MPD
-app.get("/playlist.m3u", (req, res) => {
-  const playlist = `#EXTINF:-1 tvg-id="ts78" tvg-logo="https://ltsk-cdn.s3.eu-west-1.amazonaws.com/jumpstart/Temp_Live/cdn/HLS/Channel/transparentImages/Star Sports 1 HD.png" group-title="Sports, HD",Star Sports 1 HD
-#KODIPROP:inputstream.adaptive.license_type=clearkey
-#KODIPROP:inputstream.adaptive.license_key=http://192.168.1.68:8180/get_license
-#KODIPROP:inputstream.adaptive.manifest_type=mpd
-#EXTVLCOPT:http-user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36
-http://192.168.1.68:8180/encrypted.mpd|X-Forwarded-For=59.178.74.184&Origin=https://watch.tataplay.com&Referer=https://watch.tataplay.com/`;
-
-  res.setHeader("Content-Type", "application/x-mpegURL");
-  res.send(playlist);
-});
-
-app.get("/insert-ad", async (req, res) => {
+app.get("/playlist.m3u", async (req, res) => {
   try {
-    const realMPDUrl = "http://192.168.1.68/tataplay/manifest.mpd?id=78"; // Replace with actual MPD URL
+    const response = await axios.get(
+      "http://192.168.1.124:8181/playlist.php",
+      {
+        headers: spoofHeaders,
+      }
+    );
 
-    const response = await axios.get(realMPDUrl, {
-      headers: spoofHeaders,
-    });
+    let playlist = response.data;
 
-    const originalMPD = response.data;
-    const updatedMPD = insertAdIntoMPD(originalMPD);
-    console.log(updatedMPD);
-    res.setHeader("Content-Type", "application/dash+xml");
-    res.send(updatedMPD);
+    playlist = playlist.replace(
+      /#KODIPROP:inputstream\.adaptive\.license_key=https:\/\/tp\.drmlive-01\.workers\.dev\?id=(\d+)/g,
+      "#KODIPROP:inputstream.adaptive.license_key=http://192.168.1.68:8180/get_license?id=$1"
+    );
+
+    res.setHeader("Content-Type", "application/x-mpegURL");
+    res.send(playlist);
   } catch (err) {
-    console.error("❌ Insert Ad Error:", err.message);
-    res.status(500).send("Failed to insert ad into MPD");
+    console.error("Playlist Fetch Error:", err.message);
+    res.status(500).send("Failed to fetch playlist");
   }
 });
+
 app.get("/ad-insert", (req, res) => {
   if (!adpresent) {
     adpresent = true;

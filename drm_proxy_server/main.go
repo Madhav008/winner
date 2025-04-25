@@ -1,272 +1,390 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
+	"bufio"
 	"encoding/json"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/logger"
 )
 
-var client = &http.Client{} // Shared HTTP client
-type Channel struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Logo       string `json:"logo"`
-	Group      string `json:"group"`
-	LicenseURL string `json:"license_url"`
-	StreamURL  string `json:"stream_url"`
+var config = map[string]interface{}{
+	"port":    "8180",
+	"host":    "http://192.168.1.68:8180",
+	"drmHost": "http://192.168.1.124:8181",
 }
 
-func loadChannels() ([]Channel, error) {
-	// Open the channels.json file
-	file, err := os.Open("channels.json")
+var client = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
+// Cache structure
+var (
+	cache      = make(map[string][]byte) // In-memory cache
+	cacheMutex = &sync.Mutex{}           // Mutex for thread-safe access
+	cacheFile  = "cache.json"            // File to store the cache
+)
+
+// PlaylistEntry represents a single entry in the playlist
+type PlaylistEntry struct {
+	Title         string
+	TvgID         string
+	TvgLogo       string
+	GroupTitle    string
+	LicenseType   string
+	LicenseKey    string
+	ManifestType  string
+	UserAgent     string
+	URL           string
+	AdditionalOpt string
+}
+
+// LoadCache loads the cache from the JSON file
+func LoadCache() {
+	cacheMutex.Lock()
+	defer cacheMutex.Unlock()
+
+	file, err := os.Open(cacheFile)
 	if err != nil {
-		return nil, err
+		if os.IsNotExist(err) {
+			return // No cache file exists, skip loading
+		}
+		log.Println("Error opening cache file:", err)
+		return
 	}
 	defer file.Close()
 
-	// Read the contents of the file
 	data, err := ioutil.ReadAll(file)
 	if err != nil {
-		return nil, err
+		log.Println("Error reading cache file:", err)
+		return
 	}
 
-	// Unmarshal JSON data into a slice of Channel structs
-	var channels []Channel
-	err = json.Unmarshal(data, &channels)
+	err = json.Unmarshal(data, &cache)
 	if err != nil {
-		return nil, err
+		log.Println("Error unmarshalling cache file:", err)
 	}
-	// log.Println("[INFO] Channels loaded")
-	return channels, nil
 }
 
-func extractHost(mpUrl string) (string, error) {
-	parsedUrl, err := url.Parse(mpUrl)
+// SaveCache saves the cache to the JSON file
+func SaveCache() {
+	cacheMutex.Lock()
+	defer cacheMutex.Unlock()
+
+	data, err := json.Marshal(cache)
 	if err != nil {
-		return "", err
+		log.Println("Error marshalling cache:", err)
+		return
 	}
-	return parsedUrl.Host, nil
+
+	err = ioutil.WriteFile(cacheFile, data, 0644)
+	if err != nil {
+		log.Println("Error writing cache file:", err)
+	}
 }
 
-func getLicenseId(id string) (Channel, string) {
-	channels, err := loadChannels()
-	if err != nil {
-		log.Fatalf("Error loading channels: %v", err)
-		return Channel{}, ""
-	}
+// ParsePlaylist parses an M3U playlist string and returns a slice of PlaylistEntry
+func ParsePlaylist(content string) ([]PlaylistEntry, error) {
+	var entries []PlaylistEntry
+	var currentEntry PlaylistEntry
 
-	// Loop through channels to find the channel where license_url contains the id
-	for _, channel := range channels {
-		if strings.Contains(channel.LicenseURL, id) {
-			// log.Printf("[INFO] Found channel: %+v", channel)
-			host, _ := extractHost(channel.StreamURL)
-			return channel, host
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip empty lines
+		if line == "" {
+			continue
+		}
+
+		// Parse metadata lines
+		if strings.HasPrefix(line, "#EXTINF:") {
+			// Extract metadata from the #EXTINF line
+			currentEntry = PlaylistEntry{} // Reset the current entry
+			metadata := strings.SplitN(line, ",", 2)
+			if len(metadata) == 2 {
+				currentEntry.Title = strings.TrimSpace(metadata[1])
+			}
+
+			// Extract attributes like tvg-id, tvg-logo, and group-title
+			attributes := strings.Split(metadata[0], " ")
+			for _, attr := range attributes {
+				if strings.Contains(attr, "tvg-id=") {
+					currentEntry.TvgID = strings.Trim(attr[len("tvg-id="):], `"`)
+				} else if strings.Contains(attr, "tvg-logo=") {
+					currentEntry.TvgLogo = strings.Trim(attr[len("tvg-logo="):], `"`)
+				} else if strings.Contains(attr, "group-title=") {
+					currentEntry.GroupTitle = strings.Trim(attr[len("group-title="):], `"`)
+				}
+			}
+		} else if strings.HasPrefix(line, "#KODIPROP:inputstream.adaptive.license_type=") {
+			currentEntry.LicenseType = strings.TrimPrefix(line, "#KODIPROP:inputstream.adaptive.license_type=")
+		} else if strings.HasPrefix(line, "#KODIPROP:inputstream.adaptive.license_key=") {
+			currentEntry.LicenseKey = strings.TrimPrefix(line, "#KODIPROP:inputstream.adaptive.license_key=")
+		} else if strings.HasPrefix(line, "#KODIPROP:inputstream.adaptive.manifest_type=") {
+			currentEntry.ManifestType = strings.TrimPrefix(line, "#KODIPROP:inputstream.adaptive.manifest_type=")
+		} else if strings.HasPrefix(line, "#EXTVLCOPT:http-user-agent=") {
+			currentEntry.UserAgent = strings.TrimPrefix(line, "#EXTVLCOPT:http-user-agent=")
+		} else if !strings.HasPrefix(line, "#") {
+			// If it's not a comment, treat it as the URL
+			parts := strings.SplitN(line, "|", 2)
+			currentEntry.URL = parts[0]
+			if len(parts) > 1 {
+				currentEntry.AdditionalOpt = parts[1]
+			}
+
+			// Add the completed entry to the list
+			entries = append(entries, currentEntry)
 		}
 	}
-	return Channel{}, "" // Return empty if not found
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return entries, nil
 }
 
 func main() {
-	http.HandleFunc("/mpd-proxy.mpd", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("[INFO] Incoming request to /mpd-proxy")
-		id := r.URL.Query().Get("id")
-		if id == "" {
-			log.Println("[ERROR] Missing id param")
-			http.Error(w, "Missing id param", http.StatusBadRequest)
-			return
-		}
+	LoadCache()
+	defer SaveCache() // Save the cache on shutdown
 
-		channel, host := getLicenseId(id)
+	// Initialize a new Fiber app
+	app := fiber.New()
+	app.Use(logger.New(logger.Config{
+		Format:     "[${time}] ${status} - ${method} ${path}${latency}\n",
+		TimeFormat: "2006-01-02 15:04:05",
+		TimeZone:   "Local",
+	}))
 
-		if channel.StreamURL == "" {
-			log.Println("[ERROR] No mpd url found for id", id)
-			http.Error(w, "No license url found", http.StatusNotFound)
-			return
-		}
-		req, err := http.NewRequest("GET", channel.StreamURL, nil)
+	// Define a route for the GET method on the root path '/playlist.m3u'
+	app.Get("/playlist.m3u", func(c fiber.Ctx) error {
+
+		// Get the host from the incoming request
+		host := c.Get("Host")
+		log.Println(host)
+		scheme := c.Get("Scheme")
+		log.Println(scheme)
+
+		// Fetch the playlist from the server
+		resp, err := client.Get(config["drmHost"].(string) + "/playlist.php")
 		if err != nil {
-			log.Println("[ERROR] Failed to build request:", err)
-			http.Error(w, "Request build error", http.StatusInternalServerError)
-			return
+			log.Println("Error fetching playlist:", err)
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
+		}
+		defer resp.Body.Close()
+
+		// Read the response body
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Println("Error reading response body:", err)
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
 		}
 
-		// Spoof headers
-		req.Header.Set("User-Agent", "OTT Navigator/1.7.2.2 (Linux;Android 13; 7177yu) ExoPlayerLib/2.15.1")
-		req.Header.Set("Accept-Encoding", "gzip")
-		req.Header.Set("Connection", "Keep-Alive")
-		req.Host = host
+		entries, err := ParsePlaylist(string(body))
+		if err != nil {
+			panic(err)
+		}
+		// Replace URL and LicenseKey
+		for i, entry := range entries {
+			// Replace the base URL
+			entries[i].URL = strings.Replace(entry.URL, "http://192.168.1.124:8181/", "https://"+host+"", 1)
 
-		log.Println("[INFO] Request Headers:")
-		for k, v := range req.Header {
-			log.Println(k, ":", v)
+			// Replace the license key URL
+			entries[i].LicenseKey = strings.Replace(entry.LicenseKey, "https://tp.drmlive-01.workers.dev", "https://"+host+"/get_license", 1)
+		}
+		// Process the entries (e.g., modify URLs or metadata if needed)
+		var updatedBody strings.Builder
+		for _, entry := range entries {
+			updatedBody.WriteString("#EXTINF:-1 tvg-id=\"" + entry.TvgID + "\" tvg-logo=\"" + entry.TvgLogo + "\" group-title=\"" + entry.GroupTitle + "\"," + entry.Title + "\n")
+			updatedBody.WriteString("#KODIPROP:inputstream.adaptive.license_type=" + entry.LicenseType + "\n")
+			updatedBody.WriteString("#KODIPROP:inputstream.adaptive.license_key=" + entry.LicenseKey + "\n")
+			updatedBody.WriteString("#KODIPROP:inputstream.adaptive.manifest_type=" + entry.ManifestType + "\n")
+			updatedBody.WriteString("#EXTVLCOPT:http-user-agent=" + entry.UserAgent + "\n")
+			updatedBody.WriteString(entry.URL + "|" + entry.AdditionalOpt + "\n\n")
+		}
+
+		// Return the processed playlist to the client
+		return c.SendString(updatedBody.String())
+	})
+
+	app.Post("/get_license", func(c fiber.Ctx) error {
+		id := c.Query("id")
+		if id == "" {
+			log.Println("Missing 'id' query parameter")
+			return c.Status(fiber.StatusBadRequest).SendString("Missing 'id' query parameter")
+		}
+
+		// Step 1: Read base64-encoded request body
+		body := c.Body()
+
+		log.Println("Channel License:", string(body), id)
+		// Step 2: Unmarshal into a dynamic map
+		var data map[string]interface{}
+		if err := json.Unmarshal(body, &data); err != nil {
+			log.Println("Invalid JSON:", err)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid JSON body",
+			})
+		}
+		kids, ok := data["kids"].([]interface{})
+		if !ok || len(kids) == 0 {
+			log.Println("Missing or invalid 'kids' array in JSON body")
+			return c.Status(fiber.StatusBadRequest).SendString("Missing or invalid 'kids' array in JSON body")
+		}
+
+		kid, ok := kids[0].(string)
+		if !ok {
+			log.Println("Invalid 'kid' in array")
+			return c.Status(fiber.StatusBadRequest).SendString("Invalid 'kid' in array")
+		}
+
+		key := id + "_" + kid
+
+		// Step 4: Check in-memory cache
+		cacheMutex.Lock()
+		if license, found := cache[key]; found {
+			cacheMutex.Unlock()
+			log.Println("License found in in-memory cache")
+			return c.Status(fiber.StatusOK).Send(license)
+		}
+		cacheMutex.Unlock()
+
+		// Step 5: Load cache from file and check again
+		LoadCache()
+		cacheMutex.Lock()
+		if license, found := cache[key]; found {
+			cacheMutex.Unlock()
+			log.Println("License found in file cache")
+			return c.Status(fiber.StatusOK).Send(license)
+		}
+		cacheMutex.Unlock()
+
+		// Step 7: Fetch license from upstream server
+		licenseReq, err := http.NewRequest("POST", "http://tp.drmlive-01.workers.dev/get_license?id="+id, strings.NewReader(string(body)))
+		if err != nil {
+			log.Println("Error creating license request:", err)
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
+		}
+		licenseReq.Header.Set("Content-Type", "application/octet-stream")
+
+		resp, err := client.Do(licenseReq)
+		if err != nil {
+			log.Println("Error fetching license:", err)
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
+		}
+		defer resp.Body.Close()
+
+		licenseBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Println("Error reading license response body:", err)
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
+		}
+		// Step 7: Cache and respond
+		cacheMutex.Lock()
+		cache[key] = licenseBody
+		cacheMutex.Unlock()
+		SaveCache()
+
+		return c.Status(resp.StatusCode).Send(licenseBody)
+	})
+
+	app.Get("/manifest.mpd", func(c fiber.Ctx) error {
+		id := c.Query("id")
+		if id == "" {
+			log.Println("Missing 'id' query parameter")
+			return c.Status(fiber.StatusBadRequest).SendString("Missing 'id' query parameter")
+		}
+
+		//Hit the request to drmhost
+		req, err := http.NewRequest("GET", config["drmHost"].(string)+"/manifest.mpd?id="+id, nil)
+		if err != nil {
+			log.Println("Error creating request:", err)
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
 		}
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Println("[ERROR] MPD fetch failed:", err)
-			http.Error(w, "MPD fetch failed", http.StatusBadGateway)
-			return
+			log.Println("Error fetching manifest:", err)
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
 		}
 		defer resp.Body.Close()
 
-		log.Println("[INFO] MPD fetch successful. Status Code:", resp.StatusCode)
-
-		// Read the full body
-		buf := new(bytes.Buffer)
-		_, err = io.Copy(buf, resp.Body)
+		manifestBody, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			log.Println("[ERROR] Failed reading MPD body:", err)
-			http.Error(w, "Failed to read MPD", http.StatusInternalServerError)
-			return
+			log.Println("Error reading manifest response:", err)
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
 		}
 
-		originalContent := buf.String()
+		host := c.Get("Host")
 
-		// Optional: Fix mixed content issues (HTTP -> HTTPS)
-		modified := strings.ReplaceAll(originalContent, "http://", "https://")
+		// Parse the mpd
+		updatedManifest := strings.ReplaceAll(string(manifestBody), "https://bpaita2.akamaized.net", "https"+"://"+host+"/proxy/https://bpaita2.akamaized.net")
+		// log.Println(updatedManifest)
 
-		// Return to client
-		w.Header().Set("Content-Type", "application/dash+xml")
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write([]byte(modified))
+		manifestBytes := []byte(updatedManifest)
+
+		// Return the manifest response to the client
+		return c.Status(resp.StatusCode).Send(manifestBytes)
 	})
 
-	// http.HandleFunc("/license-proxy", func(w http.ResponseWriter, r *http.Request) {
-	// 	log.Println("[INFO] Incoming request to /license-proxy")
+	app.Get("/proxy/*", func(c fiber.Ctx) error {
 
-	// 	log.Println("[INFO] License request Headers:")
-	// 	for k, v := range r.Header {
-	// 		log.Println(k, ":", v)
-	// 	}
-	// 	// Read the body coming from the player
-	// 	body, err := io.ReadAll(r.Body)
-	// 	log.Println("[INFO] Request body:", string(body))
-	// 	if err != nil {
-	// 		log.Println("[ERROR] Failed to read request body:", err)
-	// 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
-	// 		return
-	// 	}
+		// Extract the query parameters
+		fullURL := c.Request().RequestURI()
 
-	// 	req, err := http.NewRequest("POST", "https://la.drmlive.net/tp/sling_ck?id=672", bytes.NewReader(body))
-	// 	if err != nil {
-	// 		log.Println("[ERROR] Failed to build license request:", err)
-	// 		http.Error(w, "Request build error", http.StatusInternalServerError)
-	// 		return
-	// 	}
+		fullURL = []byte(strings.TrimPrefix(string(fullURL), "/proxy/"))
+		updatedUrl := strings.Replace(string(fullURL), "https:/bpaita2.akamaized.net", "https://bpaita2.akamaized.net", 1)
 
-	// 	// Spoof headers
-	// 	req.Header.Set("User-Agent", "OTT Navigator/1.7.2.2 (Linux;Android 13; 7177yu) ExoPlayerLib/2.15.1")
-	// 	req.Header.Set("Content-Type", "application/json")
-	// 	req.Header.Set("Accept-Encoding", "gzip")
-	// 	req.Header.Set("Connection", "Keep-Alive")
-	// 	req.Header.Set("Host", "la.drmlive.net")
+		log.Println("Full URL:")
+		log.Println(string(updatedUrl))
 
-	// 	resp, err := client.Do(req)
-	// 	if err != nil {
-	// 		log.Println("[ERROR] License request failed:", err)
-	// 		http.Error(w, "License request failed", http.StatusBadGateway)
-	// 		return
-	// 	}
-	// 	defer resp.Body.Close()
-
-	// 	log.Println("[INFO] License response received. Status Code:", resp.StatusCode)
-	// 	log.Println("[INFO] Response Body:", resp.Body)
-	// 	// Return the license response to the client
-	// 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-	// 	w.WriteHeader(resp.StatusCode)
-	// 	_, _ = io.Copy(w, resp.Body)
-	// })
-
-	http.HandleFunc("/proxy/license", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("[INFO] Incoming request to /license-proxy")
-		id := r.URL.Query().Get("id")
-		if id == "" {
-			log.Println("[ERROR] Missing id param")
-			http.Error(w, "Missing id param", http.StatusBadRequest)
-			return
-		}
-		// Read the body from the original player request
-		playerBody, err := io.ReadAll(r.Body)
+		// Create a new HTTP request to the provided URL
+		req, err := http.NewRequest("GET", string(updatedUrl), nil)
 		if err != nil {
-			log.Println("[ERROR] Failed to read player request body:", err)
-			http.Error(w, "Invalid request body", http.StatusBadRequest)
-			return
+			log.Println("Error creating request:", err)
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
 		}
 
-		channel, host := getLicenseId(id)
-		log.Println("[INFO] Channel:", channel.Name, "License URL:", channel.LicenseURL, "Body:", r.Body)
-		// Send that same body to the license server
-		req, err := http.NewRequest("POST", channel.LicenseURL, bytes.NewReader(playerBody))
-		if err != nil {
-			log.Println("[ERROR] Failed to build license request:", err)
-			http.Error(w, "Request build error", http.StatusInternalServerError)
-			return
-		}
+		// Remove the "/proxy" prefix from the parsed URL path
+		// parsedUrl.Path = strings.TrimPrefix(parsedUrl.Path, "/proxy")
 
-		// Copy headers exactly
-		req.Header.Set("User-Agent", r.Header.Get("User-Agent"))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept-Encoding", "gzip")
-		req.Header.Set("Connection", "Keep-Alive")
-		req.Header.Set("Host", host)
+		// Add the required headers
+		req.Header.Add("Accept-Encoding", "identity")
+		req.Header.Add("Connection", "Keep-Alive")
+		req.Header.Add("Host", "bpaita2.akamaized.net")
+		req.Header.Add("Origin", "https://watch.tataplay.com")
+		req.Header.Add("Referer", "https://watch.tataplay.com/")
+		req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
+		req.Header.Add("X-Forwarded-For", "59.178.74.184")
 
-		client := &http.Client{}
+		// Send the request using the HTTP client
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Println("[ERROR] License request failed:", err)
-			http.Error(w, "License request failed", http.StatusBadGateway)
-			return
+			log.Println("Error sending request:", err)
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
 		}
 		defer resp.Body.Close()
 
-		// Decompress if response is gzipped
-		var responseBody []byte
-		if resp.Header.Get("Content-Encoding") == "gzip" {
-			gr, err := gzip.NewReader(resp.Body)
-			if err != nil {
-				log.Println("[ERROR] Failed to decompress gzip response:", err)
-				http.Error(w, "Decompression error", http.StatusInternalServerError)
-				return
-			}
-			defer gr.Close()
-			responseBody, err = io.ReadAll(gr)
-			log.Println("[INFO] Channel:", channel.Name, "License URL:", channel.LicenseURL, "Response Key:", responseBody)
-		} else {
-			responseBody, err = io.ReadAll(resp.Body)
-		}
+		// Read the response body
+		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			log.Println("[ERROR] Failed to read license response:", err)
-			http.Error(w, "Read response error", http.StatusInternalServerError)
-			return
+			log.Println("Error reading response body:", err)
+			return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
 		}
 
-		// Set proper headers for JSON response
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(responseBody)
+		// Forward the response to the client
+		return c.Status(resp.StatusCode).Send(body)
 	})
-
-	http.HandleFunc("/playlist.m3u", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("[INFO] Incoming request to /proxy_playlist.m3u")
-		playlistData, err := os.ReadFile("proxy_playlist.m3u")
-		if err != nil {
-			log.Println("[ERROR] Failed to read proxy playlist:", err)
-			http.Error(w, "Proxy playlist read error", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/x-mpegURL")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(playlistData)
-	})
-
-	log.Println("✅ Proxy server running on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// Start the server on the configured port
+	port := config["port"]
+	log.Fatal(app.Listen(":" + port.(string)))
 }

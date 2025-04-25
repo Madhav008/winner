@@ -14,16 +14,9 @@
     const player = new shaka.Player(video);
 
     // Enable debug logs
-    shaka.log.setLevel(shaka.log.Level.DEBUG);
+    // shaka.log.setLevel(shaka.log.Level.DEBUG);
 
-    // Configure Shaka Player with DRM support for ClearKey
-    player.configure({
-      drm: {
-        clearKeys: {
-          'c3ba9fbfe24051aabab0cc33dc8593ca': '76a54120486fba939757f2c5fde50882',  // Your key_id and key
-        },
-      },
-    });
+   
 
     // Add custom headers for MPD request
     player.getNetworkingEngine().registerRequestFilter((type, request) => {
@@ -36,7 +29,7 @@
     });
 
     // Load the encrypted MPD file
-    player.load('http://192.168.1.68:8180/encrypted.mpd').then(() => {
+    player.load('http://192.168.1.68:8180/manifest.mpd?id=78').then(() => {
       console.log('Video loaded successfully');
     }).catch(error => {
       console.error('Error loading video', error);
