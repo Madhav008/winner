@@ -108,7 +108,7 @@ func ParsePlaylist(content string) ([]PlaylistEntry, error) {
 		// Parse metadata lines
 		if strings.HasPrefix(line, "#EXTINF:") {
 			// Extract metadata from the #EXTINF line
-			currentEntry = PlaylistEntry{} // Reset the current entry
+			currentEntry = 	{} // Reset the current entry
 			metadata := strings.SplitN(line, ",", 2)
 			if len(metadata) == 2 {
 				currentEntry.Title = strings.TrimSpace(metadata[1])

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"strings"
 )
 
 type MPD struct {
@@ -34,7 +33,7 @@ type Representation struct {
 type ContentProtection struct {
 	SchemeIdUri  string `xml:"schemeIdUri,attr"`
 	LicenseURL   string `xml:"licenseURL,attr"`
-	DefaultKeyID string `xml:"cenc:default_KID,attr"`
+	DefaultKeyID string `xml:"cenc\\:default_KID,attr"` // Handle namespace prefix with escaped colon
 }
 
 type SegmentTemplate struct {
@@ -66,51 +65,42 @@ func main() {
 		panic(err)
 	}
 
+	// Use pointer to pass MPD by reference and modify it in-place
 	var mpd MPD
 	err = xml.Unmarshal(data, &mpd)
 	if err != nil {
 		panic(err)
 	}
 
-	// Assume one AdaptationSet and one Representation for simplicity
-	rep := mpd.Period.BaseUrl
+	// Print the original values for verification
+	fmt.Println("Original MPD Content:")
+	fmt.Println(mpd)
 
-	proxyHost := "http://drm.ipl2025.space?url=" // Define the proxy host
-	rep = proxyHost + rep                        // Concatenate the proxy host with the base URL
+	// Modify only specific parts of the MPD
+	modifyMPD(&mpd)
 
-	// Marshal the MPD struct back to XML
-	mpdBytes, err := xml.MarshalIndent(mpd, "", "  ")
+	// After modification, print the updated MPD content
+	fmt.Println("\nModified MPD Content:")
+	updatedMPD, err := xml.MarshalIndent(mpd, "", "  ")
 	if err != nil {
 		panic(err)
 	}
-
-	// Write the MPD XML to stdout
-	fmt.Println(string(mpdBytes))
-	// durationSec := float64(tpl.Duration) / float64(tpl.Timescale)
-
-	// // Add ClearKey DRM protection if ContentProtection is found
-	// if rep.ContentProtection.SchemeIdUri == "urn:uuid:edef8ba9-79d6-4ace-a3c8-d6d5c6c69c3e" { // ClearKey UUID
-	// 	fmt.Printf("#EXT-X-KEY:METHOD=NONE,URI=\"%s\",KEYID=%s\n", rep.ContentProtection.LicenseURL, rep.ContentProtection.DefaultKeyID)
-	// }
-
-	// fmt.Println("#EXTM3U")
-	// fmt.Println("#EXT-X-VERSION:3")
-	// fmt.Printf("#EXT-X-TARGETDURATION:%.0f\n", durationSec)
-	// fmt.Printf("#EXT-X-MEDIA-SEQUENCE:%d\n", tpl.StartNumber)
-
-	// // Generate 10 segments as example
-	// for i := 0; i < 10; i++ {
-	// 	num := tpl.StartNumber + i
-	// 	segment := tpl.Media
-	// 	segment = replacePlaceholder(segment, "$Number$", strconv.Itoa(num))
-	// 	fmt.Printf("#EXTINF:%.3f,\n", durationSec)
-	// 	fmt.Println(segment)
-	// }
-
-	// fmt.Println("#EXT-X-ENDLIST")
+	fmt.Println(string(updatedMPD))
 }
 
-// Replace placeholder in the segment template (e.g., $Number$ with actual segment number)
-func replacePlaceholder(template, placeholder, value string) string {
-	return strings.Replace(template, placeholder, value, -1)
+// modifyMPD modifies only the required parts of the MPD
+func modifyMPD(mpd *MPD) {
+	// For example, modify BaseURL of the first AdaptationSet
+	if len(mpd.Period.AdaptationSets) > 0 {
+		rep := &mpd.Period.AdaptationSets[0].Representations[0]
+		// Modify the BaseURL with a proxy
+		rep.BaseURL = "http://drm.ipl2025.space?url=" + rep.BaseURL
+
+		// Modify ContentProtection if it matches a condition (e.g., ClearKey UUID)
+		if rep.ContentProtection.SchemeIdUri == "urn:uuid:edef8ba9-79d6-4ace-a3c8-d6d5c6c69c3e" { // ClearKey UUID
+			// Set the LicenseURL and DefaultKeyID for ClearKey protection
+			rep.ContentProtection.LicenseURL = "http://license.server.com"
+			rep.ContentProtection.DefaultKeyID = "12345678-90ab-cdef-1234-567890abcdef"
+		}
+	}
 }
